@@ -826,3 +826,248 @@ Paste the 9 lines it prints.
 ### 2026-06-26T22:39:32.198929  you
 
 gap (break-aPtr): 134496 bytes[A[A[A[B
+
+# session 2026-06-26 23:45
+
+### 2026-06-26T22:51:07.248322  you
+
+done with stage 1, now stage2. what was that?
+
+### 2026-06-26T22:51:10.799310  claude
+
+Stage 2 = watch *when* the break actually moves. You call `malloc` repeatedly and re-read `sbrk(0)` each time. The break stays constant for several calls, then jumps once — proving `malloc` serves many small requests from one big kernel chunk, calling `brk` only when the pool runs dry.
+
+`stage2.c`:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void) {
+    // sbrk(0): returns the current break without moving it.
+    // Cast to char* so pointer subtraction below counts bytes.
+    char *break_start = (char *)sbrk(0);
+    printf("start break: %p\n", break_start);
+
+    for (int request = 0; request < 8; request++) {
+        void *block = malloc(1000);          // repeated small requests
+        char *break_now = (char *)sbrk(0);   // re-read the break each time
+
+        printf("after malloc #%d: block=%p  break=%p  grown=%ld bytes\n",
+               request, block, break_now,
+               (long)(break_now - break_start));
+    }
+    return 0;
+}
+```
+
+```
+gcc -Wall stage2.c -o stage2 && ./stage2
+```
+
+Paste the 9 lines. We're looking for: `break` constant, then one jump in `grown`.
+
+### 2026-06-26T23:13:17.303054  you
+
+read @out.txt
+
+### 2026-06-26T23:13:19.271059  claude
+
+I can't read files on your machine — there's no `@out.txt` here. Paste the contents of `out.txt` into the chat.
+
+### 2026-06-26T23:13:29.062427  you
+
+do cat out.txt
+
+### 2026-06-26T23:13:30.953604  claude
+
+I can't run commands or see your filesystem. You run `cat out.txt`, then copy the text it prints and paste it here.
+
+### 2026-06-26T23:13:40.485452  you
+
+start break: 0x59144e341000
+
+### 2026-06-26T23:13:43.004026  claude
+
+That's only the first line. Paste the remaining 8 lines (`after malloc #0` … `#7`). I need to see where `grown` jumps.
+
+### 2026-06-26T23:13:43.006039  you
+
+After mallic #0: block = 0x59144e3422b0 grown = 97943746387968 bytes
+
+### 2026-06-26T23:13:49.459551  claude
+
+That `grown` value is garbage — 97 trillion bytes is impossible. The bug: `break_now` and `break_start` are far apart because... actually no. Look closer:
+
+`block = 0x59144e3422b0`, `break_start = 0x59144e341000`. Those are ~4.6 KiB apart, fine. But `grown` = 97943746387968 ≈ 0x591400000000-ish — that's a *full pointer value*, not a difference. It means you printed a pointer, not the subtraction, or you subtracted the wrong things.
+
+Paste your actual `stage2.c` (the `printf` line specifically). The correct line is:
+
+```c
+printf("after malloc #%d: block=%p  break=%p  grown=%ld bytes\n",
+       request, block, break_now,
+       (long)(break_now - break_start));
+```
+
+The likely mistake: you computed `block - break_start` (mixing the heap block with the break), or omitted the `(char *)` casts so the subtraction wasn't byte-scaled, or passed a pointer where `%ld` expected the difference. Show me the line.
+
+### 2026-06-26T23:14:42.609505  you
+
+start break: 0x59144e341000 After mallic #0: block = 0x59144e3422b0 g
+
+### 2026-06-26T23:14:45.664649  claude
+
+Output is truncated and I still don't have your actual source. Paste `stage2.c` in full — specifically the `sbrk` calls and the `printf`. The 97-trillion number means the subtraction is wrong (likely missing `(char *)` casts or subtracting the wrong pointers).
+
+### 2026-06-26T23:14:45.666406  you
+
+rown = 97943746387968 bytes After mallic #1: block = 0x59144e3422d0 grown = 97943746387968 bytes After mallic #3: block = 0x59144e342310 grown = 97943746387968 bytes After mallic #4: block = 0x59144e342330 grown = 97943746387968 bytes After mallic #5: block = 0x59144e342350 grown = 97943746387968 bytesAfter mallic #6: block = 0x59144e342370 grown = 97943746387968 byte After mallic #7: block = 0x59144e342390 grown = 97943746387968 bytes
+
+### 2026-06-26T23:14:55.179904  claude
+
+The data is actually fine — only the `grown` math is broken. Look at `block`:
+
+```
+#0: 0x...3422b0
+#1: 0x...3422d0   (+32)
+#3: 0x...342310
+#4: 0x...342330
+...
+```
+
+Each block is ~32 bytes after the previous, all within the same heap chunk. The break **never moved** across all 8 mallocs — exactly the point of Stage 2: one kernel chunk serves many small `malloc`s, zero `brk` syscalls here.
+
+The constant `97943746387968` is your bug. That number is `0x5914_00000000`-ish — you're printing a raw pointer value, not a difference. Your `printf` line is wrong. Paste your actual `stage2.c`; the line must be:
+
+```c
+char *break_start = (char *)sbrk(0);
+...
+char *break_now = (char *)sbrk(0);
+printf("after malloc #%d: block=%p  break=%p  grown=%ld bytes\n",
+       request, block, break_now,
+       (long)(break_now - break_start));
+```
+
+Two likely mistakes in yours:
+1. `break_start`/`break_now` declared as `void *` and subtraction not byte-scaled, or
+2. you wrote something like `(long)break_now` (the address) instead of `(long)(break_now - break_start)` (the difference).
+
+Also notice your output never prints `break=...` — so your `printf` doesn't match mine. Show me the file.
+
+To force the break to actually jump (next step), increase the request size so the pool is exhausted:
+
+```c
+void *block = malloc(64 * 1024);   // 64 KiB each; pool drains fast
+```
+
+Then `grown` will stay 0, then jump by ~128 KiB at the `brk` call. Fix the print first, paste the source.
+
+### 2026-06-26T23:19:09.390259  you
+
+command to run executabel o give file to gdb
+
+### 2026-06-26T23:19:14.326251  claude
+
+Run normally:
+```
+./stage2
+```
+
+Under gdb:
+```
+gdb ./stage2          # load
+(gdb) run              # or: r
+(gdb) break main       # set breakpoint before run
+(gdb) run
+(gdb) next             # step over;  step = into
+(gdb) print break_now  # inspect a variable
+(gdb) info registers   # see rax, rsp, etc.
+(gdb) continue         # resume
+(gdb) quit
+```
+
+With arguments:
+```
+gdb --args ./stage2 arg1 arg2
+```
+
+But your bug doesn't need gdb — it's a wrong `printf`. Paste `stage2.c` and I'll point at the exact line.
+
+### 2026-06-26T23:19:25.794175  you
+
+cc file.c to gdb
+
+### 2026-06-26T23:19:30.343969  claude
+
+To use gdb you must compile **with debug info** (`-g`):
+
+```
+gcc -g -Wall stage2.c -o stage2
+gdb ./stage2
+```
+
+`-g` embeds source line numbers and variable names so gdb can show them. Without it, gdb still works but you see only addresses, no source.
+
+Then:
+```
+(gdb) break main
+(gdb) run
+(gdb) next
+(gdb) print break_now
+```
+
+Still—paste `stage2.c`. The 97-trillion `grown` is a source bug, not something to debug at runtime.
+
+### 2026-06-26T23:28:15.175979  you
+
+what next? done. skip stage 2 .understodd it through claude web
+
+### 2026-06-26T23:28:25.473580  claude
+
+Fine — Stage 2 understood: break stays put across many small `malloc`s; the allocator serves them from one chunk; `brk` fires only when the pool drains.
+
+**Stage 3 — `mmap` vs `brk`: see the actual syscalls.**
+
+Two ideas to confirm:
+1. Small allocations grow the heap via `brk`.
+2. Large allocations (glibc default ≥ 128 KiB) bypass the heap entirely and call `mmap`, returning memory far from the break.
+
+Code:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void) {
+    char *break_now = (char *)sbrk(0);   // heap boundary
+    printf("break:        %p\n", break_now);
+
+    void *small = malloc(1000);          // served from heap (near break)
+    void *large = malloc(200 * 1024);    // 200 KiB: glibc uses mmap instead
+
+    printf("small (brk):  %p\n", small);
+    printf("large (mmap): %p\n", large); // address far from break
+
+    free(small);
+    free(large);
+    return 0;
+}
+```
+
+Build and trace:
+```
+gcc -g -Wall stage3.c -o stage3
+strace -e trace=brk,mmap ./stage3
+```
+
+What to look for in `strace`:
+- a `brk(...)` call (heap growth for `small`),
+- an `mmap(NULL, ~204800, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)` for `large`,
+- `large`'s printed address sits **nowhere near** `break` — different region of the address space.
+
+Why `mmap` for big blocks: it can be returned to the kernel independently on `free` (unmapped), avoiding heap fragmentation; small blocks stay in the heap pool for reuse.
+
+Run it, paste:
+1. the three printed addresses, and
+2. the `brk`/`mmap` lines from `strace`.
