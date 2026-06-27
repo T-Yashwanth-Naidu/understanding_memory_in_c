@@ -53,3 +53,7 @@ dkms.conf
 
 # debug information files
 *.dwo
+DRAFT_LEARNINGS.md
+__pycache__/
+DRAFT_LEARNINGS.md
+*.pyc
