@@ -1,0 +1,6 @@
+BIG chunk Virtual Address: 0x70254334b010
+BIG CHUNK BEFORE poke: Present = 0
+BIG CHUNK AFTER poke: Present = 1
+SMALL Chunk Virtual Address: 0x5e29b7e252a0
+SMALL Chunk Before Poke: 1
+SMALL Chunk After Poke: 1
