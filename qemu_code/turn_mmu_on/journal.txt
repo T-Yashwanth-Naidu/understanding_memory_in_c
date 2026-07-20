@@ -1,0 +1,147 @@
+===============================================================================
+ BARE-METAL RISC-V  |  UNDERSTANDING MEMORY  |  JOURNAL
+ Stage 3a : turn the MMU on (Sv39 paging)          date: 2026-07-19
+===============================================================================
+
+THE ONE-LINE SPINE
+------------------
+Rebuild the memory translator by hand.
+Linux hid it  ->  bare metal removed it  ->  I put it back myself.
+
+
+WHERE THIS SITS IN THE WHOLE ARC
+--------------------------------
+  P1  Linux userspace, observe memory ................. DONE
+  P2  Build my own allocator (bump + free list) ....... DONE
+  P3  Bare metal RISC-V on QEMU virt, no OS ........... HERE
+      S1  Boot + print one byte ....................... DONE
+      S2  Allocator on linker-defined heap ............ DONE
+      S3  Turn the MMU on ............................. CURRENT
+          3.0  Design (Sv39, PTE, 2 gigapages) ........ DONE
+          3a   Enable paging .......................... DONE  <-- this journal
+          3b   Rebuild RAM as 3-level 4KB pages ....... LATER
+
+
+STAGE 3a, THE FOUR SUBSTEPS AND HOW EACH WAS PROVEN
+---------------------------------------------------
+  i.   Write the page table (2 root entries in C)
+       proof: gdb  x/4gx &root  showed 0xCF, 0, 0x200000CF, 0
+
+  ii.  Drop M-mode -> S-mode (PMP + mstatus.MPP + mepc + mret)
+       proof: gdb  info registers priv  ->  0x1 [Supervisor]
+
+  iii. Write satp + sfence.vma (translation ON)
+       proof: gdb  p/x $satp  ->  0x8000000000080002
+
+  iv.  Negative fault test (touch an unmapped slot, catch the trap)
+       proof: running kernel printed 'F' from the S-mode trap handler
+              (F only runs if a real page fault fired and was caught)
+
+
+WHAT satp ACTUALLY HOLDS
+------------------------
+  satp = 0x8000000000080002
+
+     bits 63:60      bits 59:44        bits 43:0
+     +---------+   +-----------+   +----------------+
+     |   0x8   |   |    0x0    |   |    0x80002     |
+     +---------+   +-----------+   +----------------+
+        MODE           ASID              PPN
+         |              |                 |
+     8 = Sv39        one address     frame number of root table
+     paging ON       space           0x80002 << 12 = 0x80002000
+                                      (physical address of root[])
+
+  Top nibble = the on-switch.  Low bits = a pointer to the table.
+
+
+THE ROOT TABLE satp POINTS AT
+-----------------------------
+  ROOT TABLE @ 0x80002000
+  +-------+-------------+-------------------------+----------+
+  | slot  | PTE value   | virtual range -> phys   | state    |
+  +-------+-------------+-------------------------+----------+
+  |   0   | 0x000000CF  | 0-1GB   -> 0x00000000   | VALID    |  UART
+  |   1   | 0x00000000  | 1-2GB   -> nothing      | INVALID  |  <- fault target
+  |   2   | 0x200000CF  | 2-3GB   -> 0x80000000   | VALID    |  code + RAM
+  | 3-511 | 0x00000000  | ...                     | INVALID  |
+  +-------+-------------+-------------------------+----------+
+
+  PTE flag byte 0xCF  =  D A _ _ X W R V  =  1100 1111
+    V valid, R read, W write, X exec, A accessed, D dirty.
+
+
+HOW A PTE VALUE IS BUILT (the rule to remember)
+-----------------------------------------------
+  PTE = (PA >> 12) << 10 | flags        which simplifies to
+  PTE = (PA >> 2) | flags
+
+    >> 12  : drop the 4KB page offset, leaving the frame number (PPN)
+    << 10  : slide PPN above the 10 low flag bits
+    | flags: OR the permission/status bits into the low byte
+
+  RAM leaf : (0x80000000 >> 2) | 0xCF = 0x20000000 | 0xCF = 0x200000CF
+  UART leaf: (0x00000000 >> 2) | 0xCF = 0x000000CF
+
+
+WHAT NOW HAPPENS ON EVERY MEMORY ACCESS
+---------------------------------------
+  CPU wants VA -> slot = VA >> 30 -> read PTE -> valid ? use it : FAULT
+
+  0x80000000  (running code)  slot 2  0x200000CF valid  -> PA 0x80000000  OK
+  0x10000000  (UART, 'A')     slot 0  0x000000CF valid  -> PA 0x10000000  OK
+  0x40000000  (bad load)      slot 1  0x00000000 INVALID -> PAGE FAULT
+
+  Why the machine survived turning paging on:
+  slots 0 and 2 map every live address to ITSELF (identity map),
+  so nothing moved. That invisibility is exactly why the fault test
+  in step iv was needed: slot 1 is the only address whose behaviour
+  differs between paging-on and paging-off.
+
+
+THE TRAP PATH (step iv, what makes 'F' possible)
+------------------------------------------------
+  bad load at 0x40000000
+        |
+        v
+  page-table walk finds slot 1 invalid
+        |
+        v
+  hardware raises a load page fault (scause = 0xd = 13)
+        |
+        v
+  medeleg delegated it, so it goes to S-mode, not M-mode
+        |
+        v
+  stvec points at trap_entry (boot.s)
+        |
+        v
+  trap_entry calls s_trap_handler (C)
+        |
+        v
+  handler prints 'F'  <-- the proof
+
+
+FILES AND THEIR JOB AFTER STAGE 3a
+----------------------------------
+  boot.s      : stack, zero bss, M->S drop, medeleg, trap vector stub
+  kernel.ld   : memory map, section layout, stack + heap symbols
+  level2.c    : bump + free-list allocator on the linker heap
+  paging.c    : build_page_table (root leaves), enable_paging (satp)
+  mainfile.c  : uart_putc, set_trap_vector, s_trap_handler, main, bad-load test
+
+
+RESTORE POINT
+-------------
+  Last hardware-proven good state = step iii (satp live, 0x8000000000080002).
+  If a later change breaks things, roll back to there.
+  Step iv is now also proven (F printed), so Stage 3a as a whole is complete.
+
+
+NEXT
+----
+  Stage 3b: rebuild the RAM mapping as a full three-level tree of 4KB pages
+  instead of one 1GB gigapage. Same address, finer granularity. This is the
+  deep dive into how real page tables actually branch.
+
+===============================================================================
